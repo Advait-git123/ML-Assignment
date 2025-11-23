@@ -1,8 +1,8 @@
 """
 Anomaly_Detection.py
-Unsupervised multivariate anomaly detection using:
-PCA, k-Means, Hierarchical Clustering, DBSCAN, GMM (EM), One-Class SVM.
-Final anomaly decision is based on a combined anomaly score and a robust MAD threshold.
+Multithreaded (model-level) anomaly detection, Python 3.13-safe.
+Runs PCA, k-Means, Hierarchical, DBSCAN, GMM, One-Class SVM in parallel
+and uses a combined normalized score with MAD thresholding.
 """
 
 # ------------------------------
@@ -24,10 +24,33 @@ SAVE_PLOT = True
 PRINT_SUMMARY = True
 
 # ------------------------------
+# THREAD / BLAS TUNING
+# ------------------------------
+import os
+import multiprocessing
+
+# Use logical CPU count as default thread count for BLAS
+_cpu_count = multiprocessing.cpu_count() or 1
+BLAS_THREADS = int(min(8, max(1, _cpu_count)))  # cap to 8 by default
+
+# for OpenBLAS / MKL / OMP
+os.environ.setdefault("OPENBLAS_NUM_THREADS", str(BLAS_THREADS))
+os.environ.setdefault("OMP_NUM_THREADS", str(BLAS_THREADS))
+os.environ.setdefault("MKL_NUM_THREADS", str(BLAS_THREADS))
+# avoid loky physical-core probing
+os.environ.setdefault("LOKY_MAX_CPU_COUNT", "1")
+
+# ------------------------------
 # IMPORTS
 # ------------------------------
+import warnings
+warnings.filterwarnings("ignore")
+
+import time
 import numpy as np
 import pandas as pd
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
@@ -36,8 +59,8 @@ from sklearn.neighbors import NearestNeighbors
 from sklearn.mixture import GaussianMixture
 from sklearn.svm import OneClassSVM
 from sklearn.metrics import pairwise_distances_argmin_min
+
 import matplotlib.pyplot as plt
-import time
 
 # ------------------------------
 # HELPERS
@@ -54,13 +77,10 @@ def find_custid_column(df):
 def preprocess_numeric(df, cust_col):
     drop_cols = [c for c in df.columns if c != cust_col and "id" in c.lower()]
     df_num = df.drop(columns=drop_cols, errors="ignore").select_dtypes(include=[np.number])
-
     X_imp = pd.DataFrame(SimpleImputer(strategy="median").fit_transform(df_num),
                          columns=df_num.columns)
-
     X_scaled = pd.DataFrame(StandardScaler().fit_transform(X_imp),
                             columns=df_num.columns)
-
     return X_scaled, X_imp
 
 def minmax(x):
@@ -74,7 +94,7 @@ def robust_z_score(values):
     return np.zeros_like(values) if mad == 0 else 0.6745 * (values - med) / mad
 
 # ------------------------------
-# MODEL SCORERS
+# MODEL SCORERS (each returns appropriate outputs)
 # ------------------------------
 def pca_recon_error(X):
     p = PCA(n_components=PCA_VARIANCE_KEEP, svd_solver='full', random_state=RANDOM_STATE)
@@ -107,50 +127,81 @@ def gmm_score(X):
 
 def ocsvm_score(X):
     oc = OneClassSVM(nu=OCSVM_NU, gamma="scale").fit(X)
-    score = -oc.score_samples(X)
-    return score, (oc.predict(X) == -1).astype(int)
+    raw = -oc.score_samples(X)
+    return raw, (oc.predict(X) == -1).astype(int)
 
 # ------------------------------
-# MAIN PIPELINE
+# MAIN PIPELINE (parallelized)
 # ------------------------------
-def run_pipeline():
+def run_pipeline(max_workers=None):
     start_time = time.time()
-
     df = pd.read_csv(CSV_PATH)
     cust_col = find_custid_column(df)
     X_scaled, _ = preprocess_numeric(df, cust_col)
 
-    pca_err = pca_recon_error(X_scaled)
-    km = kmeans_score(X_scaled)
-    hr = hierarchical_score(X_scaled)
-    db_kd, db_flag, db_labels, db_eps = dbscan_score(X_scaled)
-    gmm = gmm_score(X_scaled)
-    oc, oc_flag = ocsvm_score(X_scaled)
+    # determine number of workers (cap to 6 to avoid oversubscription)
+    if max_workers is None:
+        max_workers = min(6, max(1, _cpu_count))
 
+    # submit all model scorers in parallel threads
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {
+            ex.submit(pca_recon_error, X_scaled): "pca",
+            ex.submit(kmeans_score, X_scaled): "kmeans",
+            ex.submit(hierarchical_score, X_scaled): "hier",
+            ex.submit(dbscan_score, X_scaled): "dbscan",
+            ex.submit(gmm_score, X_scaled): "gmm",
+            ex.submit(ocsvm_score, X_scaled): "ocsvm",
+        }
+
+        # placeholders
+        pca_err = km = hr = db_kd = db_flag = db_labels = db_eps = gmm = oc = oc_flag = None
+
+        for fut in as_completed(futures):
+            name = futures[fut]
+            try:
+                res = fut.result()
+            except Exception as e:
+                raise RuntimeError(f"Model {name} failed: {e}") from e
+
+            if name == "pca":
+                pca_err = res
+            elif name == "kmeans":
+                km = res
+            elif name == "hier":
+                hr = res
+            elif name == "dbscan":
+                db_kd, db_flag, db_labels, db_eps = res
+            elif name == "gmm":
+                gmm = res
+            elif name == "ocsvm":
+                oc, oc_flag = res
+
+    # assemble scores
     scores = pd.DataFrame({
         "pca": pca_err, "kmeans": km, "hier": hr,
         "db_kdist": db_kd, "gmm": gmm, "ocsvm": oc,
         "db_flag": db_flag, "oc_flag": oc_flag
     })
 
+    # normalize and combine
     for col in ["pca", "kmeans", "hier", "db_kdist", "gmm", "ocsvm"]:
         scores[col + "_n"] = minmax(scores[col])
 
-    scores["anomaly_percent"] = (
-        scores[["pca_n", "kmeans_n", "hier_n", "db_kdist_n", "gmm_n", "ocsvm_n"]]
-        .mean(axis=1) * 100
-    )
+    scores["anomaly_percent"] = scores[["pca_n", "kmeans_n", "hier_n", "db_kdist_n", "gmm_n", "ocsvm_n"]].mean(axis=1) * 100
 
     combined_z = robust_z_score(scores["anomaly_percent"])
     scores["is_anomaly"] = (combined_z > MAD_THRESHOLD).astype(int)
 
-    z_pca = robust_z_score(scores["pca"])
-    z_km = robust_z_score(scores["kmeans"])
-    z_hr = robust_z_score(scores["hier"])
-    z_db = robust_z_score(scores["db_kdist"])
-    z_gmm = robust_z_score(scores["gmm"])
-    z_oc = robust_z_score(scores["ocsvm"])
+    # per-model MAD counts
+    count_pca = (robust_z_score(scores["pca"]) > MAD_THRESHOLD).sum()
+    count_km = (robust_z_score(scores["kmeans"]) > MAD_THRESHOLD).sum()
+    count_hr = (robust_z_score(scores["hier"]) > MAD_THRESHOLD).sum()
+    count_db = (robust_z_score(scores["db_kdist"]) > MAD_THRESHOLD).sum()
+    count_gmm = (robust_z_score(scores["gmm"]) > MAD_THRESHOLD).sum()
+    count_oc = (robust_z_score(scores["ocsvm"]) > MAD_THRESHOLD).sum()
 
+    # save results
     out = pd.DataFrame({
         "CUST_ID": df[cust_col] if cust_col else df.index,
         "anomaly_percent": scores["anomaly_percent"],
@@ -158,28 +209,28 @@ def run_pipeline():
     })
     out.to_csv(OUTPUT_CSV, index=False)
 
+    # plot
     if SAVE_PLOT:
         pca_vis = PCA(n_components=2).fit(X_scaled)
         vis = pca_vis.transform(X_scaled)
-        var1, var2 = pca_vis.explained_variance_ratio_ * 100
+        var1 = pca_vis.explained_variance_ratio_[0] * 100
+        var2 = pca_vis.explained_variance_ratio_[1] * 100
 
         plt.figure(figsize=(9,7))
         sc = plt.scatter(vis[:,0], vis[:,1], c=scores["anomaly_percent"], cmap="viridis", s=25)
 
         an_idx = scores.index[scores["is_anomaly"] == 1]
-        plt.scatter(vis[an_idx,0], vis[an_idx,1],
-                    facecolors='none', edgecolors='k', s=80, label="Anomalies")
+        plt.scatter(vis[an_idx,0], vis[an_idx,1], facecolors='none', edgecolors='k', s=80, label="Anomalies")
 
         plt.xlabel(f"PCA Component 1 ({var1:.2f}% variance)")
         plt.ylabel(f"PCA Component 2 ({var2:.2f}% variance)")
-        plt.title("2D PCA Projection – Anomaly Detection")
+        plt.title("2D PCA Projection (MAD-Based Anomaly Detection)")
         plt.colorbar(sc).set_label("Anomaly % Score")
         plt.legend()
         plt.tight_layout()
         plt.savefig(PLOT_IMAGE, dpi=200)
 
-    end_time = time.time()
-    total_time = end_time - start_time
+    total_time = time.time() - start_time
 
     if PRINT_SUMMARY:
         print("ANOMALY DETECTION RESULT SUMMARY")
@@ -189,12 +240,12 @@ def run_pipeline():
         print(f"Detected anomalies (MAD > {MAD_THRESHOLD}): {scores['is_anomaly'].sum()}\n")
 
         print("Counts flagged per model:")
-        print(f" - PCA reconstruction error: { (z_pca > MAD_THRESHOLD).sum() }")
-        print(f" - k-Means distance: { (z_km > MAD_THRESHOLD).sum() }")
-        print(f" - Hierarchical distance: { (z_hr > MAD_THRESHOLD).sum() }")
-        print(f" - DBSCAN k-distance: { (z_db > MAD_THRESHOLD).sum() }")
-        print(f" - GMM neg-log-likelihood: { (z_gmm > MAD_THRESHOLD).sum() }")
-        print(f" - One-Class SVM score: { (z_oc > MAD_THRESHOLD).sum() }")
+        print(f" - PCA reconstruction error: {count_pca}")
+        print(f" - k-Means distance: {count_km}")
+        print(f" - Hierarchical distance: {count_hr}")
+        print(f" - DBSCAN k-distance: {count_db}")
+        print(f" - GMM neg-log-likelihood: {count_gmm}")
+        print(f" - One-Class SVM score: {count_oc}")
         print(f" - DBSCAN explicit labels: {scores['db_flag'].sum()}")
         print(f" - One-Class SVM explicit labels: {scores['oc_flag'].sum()}\n")
 
@@ -203,7 +254,6 @@ def run_pipeline():
         print(f"Plot saved to: {PLOT_IMAGE}")
 
     return out
-
 
 if __name__ == "__main__":
     run_pipeline()
